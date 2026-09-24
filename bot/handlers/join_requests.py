@@ -55,20 +55,42 @@ async def on_join_request(request: ChatJoinRequest, db: Database, bot: Bot) -> N
 
 @router.chat_member()
 async def on_chat_member(update: ChatMemberUpdated, db: Database, bot: Bot) -> None:
-    """Send the goodbye message when a member leaves or is removed."""
+    """Send the goodbye message when a member leaves or is removed.
+
+    Telegram only delivers ``chat_member`` updates while the bot is an
+    administrator of the chat. If no departure event arrives we simply never
+    reach this handler — we never fabricate a delivery. Whether goodbye
+    messages are sent at all is controlled globally by the admin (the
+    ``goodbye`` row of ``global_messages``), which ``deliver_message`` checks.
+    """
     channel = await db.get_channel_by_chat(update.chat.id)
-    if channel is None or not channel["goodbye_enabled"]:
+    if channel is None:
         return
 
     old_status = update.old_chat_member.status
     new_status = update.new_chat_member.status
     was_member = old_status in {"member", "administrator", "creator", "restricted"}
     now_gone = new_status in {"left", "kicked"}
+    if not (was_member and now_gone):
+        return
 
-    if was_member and now_gone:
-        user = update.new_chat_member.user
-        if user.is_bot:
-            return
-        await deliver_message(
-            bot, db, user.id, user.first_name or "there", channel, "goodbye"
+    user = update.new_chat_member.user
+    if user.is_bot:
+        return
+
+    delivered = await deliver_message(
+        bot,
+        db,
+        user.id,
+        user.first_name or "there",
+        channel["title"] or "the channel",
+        "goodbye",
+    )
+    if delivered:
+        logger.info("Goodbye delivered to %s for chat %s", user.id, update.chat.id)
+    else:
+        logger.info(
+            "Goodbye not sent to %s for chat %s (disabled or user unreachable)",
+            user.id,
+            update.chat.id,
         )

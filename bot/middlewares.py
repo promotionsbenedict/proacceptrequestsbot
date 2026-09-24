@@ -17,9 +17,18 @@ async def is_subscribed(bot: Bot, channel: str, user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(channel, user_id)
     except TelegramBadRequest as exc:
-        # If the bot can't read the channel, don't lock users out.
-        logger.warning("Membership check failed for %s: %s", channel, exc)
-        return True
+        # Fail closed: if membership cannot be verified we must NOT grant access.
+        # This almost always means the bot is not an admin/member of the required
+        # channel and cannot query it — add the bot to @proacceptrequests so it
+        # can verify membership.
+        logger.warning(
+            "Membership check failed for %s (user %s): %s — blocking until the "
+            "bot can verify membership.",
+            channel,
+            user_id,
+            exc,
+        )
+        return False
     if member.status in _MEMBER_STATUSES:
         return True
     # 'restricted' members are still in the chat when is_member is True.
