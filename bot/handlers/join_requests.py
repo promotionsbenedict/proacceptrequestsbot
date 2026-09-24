@@ -43,10 +43,14 @@ async def on_join_request(request: ChatJoinRequest, db: Database, bot: Bot) -> N
         logger.warning("Failed to approve %s in %s: %s", user.id, chat_id, exc)
         return
 
-    if channel["welcome_enabled"]:
-        await deliver_message(
-            bot, db, user.id, user.first_name or "there", channel, "welcome"
-        )
+    await deliver_message(
+        bot,
+        db,
+        user.id,
+        user.first_name or "there",
+        channel["title"] or "the channel",
+        "welcome",
+    )
 
 
 @router.chat_member()

@@ -8,6 +8,12 @@ import aiosqlite
 # Free plan limit; premium users are unlimited.
 FREE_CHANNEL_LIMIT = 1
 
+# Global, admin-controlled greeting defaults. Support {first_name} and {chat_title}.
+DEFAULT_WELCOME = (
+    "Welcome, {first_name}! Your request to join {chat_title} has been approved."
+)
+DEFAULT_GOODBYE = "Goodbye {first_name}, sorry to see you leave {chat_title}."
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -61,16 +67,16 @@ class Database:
                 title           TEXT,
                 type            TEXT,
                 is_active       INTEGER NOT NULL DEFAULT 0,
-                welcome_enabled INTEGER NOT NULL DEFAULT 1,
-                welcome_text    TEXT,
-                welcome_image   TEXT,
-                welcome_buttons TEXT,
-                goodbye_enabled INTEGER NOT NULL DEFAULT 0,
-                goodbye_text    TEXT,
-                goodbye_image   TEXT,
-                goodbye_buttons TEXT,
                 created_at      TEXT NOT NULL,
                 UNIQUE(owner_id, chat_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS global_messages (
+                kind        TEXT PRIMARY KEY,
+                enabled     INTEGER NOT NULL DEFAULT 1,
+                text        TEXT,
+                image       TEXT,
+                buttons     TEXT
             );
 
             CREATE TABLE IF NOT EXISTS pending_requests (
@@ -110,6 +116,32 @@ class Database:
                 created_at  TEXT NOT NULL
             );
             """
+        )
+        # Seed the two global greetings once; admin edits them afterwards.
+        await self.db.execute(
+            "INSERT OR IGNORE INTO global_messages (kind, enabled, text) VALUES (?, 1, ?)",
+            ("welcome", DEFAULT_WELCOME),
+        )
+        await self.db.execute(
+            "INSERT OR IGNORE INTO global_messages (kind, enabled, text) VALUES (?, 0, ?)",
+            ("goodbye", DEFAULT_GOODBYE),
+        )
+        await self.db.commit()
+
+    # ---------- global messages (admin-controlled) ----------
+
+    async def get_global_message(self, kind: str) -> Optional[aiosqlite.Row]:
+        cur = await self.db.execute(
+            "SELECT * FROM global_messages WHERE kind = ?", (kind,)
+        )
+        return await cur.fetchone()
+
+    async def set_global_message_field(self, kind: str, field: str, value: Any) -> None:
+        allowed = {"enabled", "text", "image", "buttons"}
+        if field not in allowed:
+            raise ValueError(f"Illegal global message field: {field}")
+        await self.db.execute(
+            f"UPDATE global_messages SET {field} = ? WHERE kind = ?", (value, kind)
         )
         await self.db.commit()
 
@@ -157,21 +189,14 @@ class Database:
     ) -> int:
         cur = await self.db.execute(
             """
-            INSERT INTO channels (owner_id, chat_id, title, type, welcome_text, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO channels (owner_id, chat_id, title, type, created_at)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(owner_id, chat_id) DO UPDATE SET
                 title = excluded.title,
                 type = excluded.type
             RETURNING id
             """,
-            (
-                owner_id,
-                chat_id,
-                title,
-                chat_type,
-                "Welcome, {first_name}! Your request to join {chat_title} has been approved.",
-                _now(),
-            ),
+            (owner_id, chat_id, title, chat_type, _now()),
         )
         row = await cur.fetchone()
         await self.db.commit()
@@ -208,24 +233,6 @@ class Database:
         await self.db.execute(
             "UPDATE channels SET is_active = ? WHERE id = ?",
             (1 if active else 0, channel_id),
-        )
-        await self.db.commit()
-
-    async def update_channel_field(self, channel_id: int, field: str, value: Any) -> None:
-        allowed = {
-            "welcome_enabled",
-            "welcome_text",
-            "welcome_image",
-            "welcome_buttons",
-            "goodbye_enabled",
-            "goodbye_text",
-            "goodbye_image",
-            "goodbye_buttons",
-        }
-        if field not in allowed:
-            raise ValueError(f"Illegal channel field: {field}")
-        await self.db.execute(
-            f"UPDATE channels SET {field} = ? WHERE id = ?", (value, channel_id)
         )
         await self.db.commit()
 

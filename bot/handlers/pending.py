@@ -48,22 +48,42 @@ async def approve_all(query: CallbackQuery, db: Database, bot: Bot) -> None:
         return
 
     pending = await db.list_pending(channel["chat_id"])
+    if not pending:
+        await query.answer()
+        await query.message.answer(
+            f"No tracked pending requests for <b>{channel['title']}</b>.\n\n"
+            "<i>Telegram does not let bots fetch join requests submitted before "
+            "the bot became an admin, so those cannot be approved in bulk. New "
+            "requests received while I am an admin are approved automatically.</i>"
+        )
+        return
+
     approved = 0
+    failed = 0
     for req in pending:
         try:
             await bot.approve_chat_join_request(channel["chat_id"], req["user_id"])
             approved += 1
         except TelegramBadRequest as exc:
+            # Request may already be handled or expired on Telegram's side.
             logger.info("Approve failed for %s: %s", req["user_id"], exc)
+            failed += 1
         await db.remove_pending(channel["chat_id"], req["user_id"])
-        if channel["welcome_enabled"]:
-            await deliver_message(
-                bot, db, req["user_id"], req["first_name"] or "there", channel, "welcome"
-            )
+        await deliver_message(
+            bot,
+            db,
+            req["user_id"],
+            req["first_name"] or "there",
+            channel["title"] or "the channel",
+            "welcome",
+        )
 
     await query.answer(f"Approved {approved} request(s).")
+    summary = f"✅ Approved <b>{approved}</b> request(s) for <b>{channel['title']}</b>."
+    if failed:
+        summary += (
+            f"\n\n⚠️ {failed} request(s) could not be approved — they may have "
+            "expired or were already handled."
+        )
     entries = await _pending_entries(db, query.from_user.id)
-    await query.message.answer(
-        f"✅ Approved <b>{approved}</b> request(s) for <b>{channel['title']}</b>.",
-        reply_markup=pending_keyboard(entries),
-    )
+    await query.message.answer(summary, reply_markup=pending_keyboard(entries))

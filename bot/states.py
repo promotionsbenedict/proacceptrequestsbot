@@ -6,9 +6,9 @@ class AddChannel(StatesGroup):
 
 
 class CustomizeMessage(StatesGroup):
-    """Shared states for editing welcome/goodbye content.
+    """Shared states for editing the global welcome/goodbye content (admin only).
 
-    `state.data` carries {"channel_id": int, "kind": "welcome" | "goodbye"}.
+    `state.data` carries {"kind": "welcome" | "goodbye"}.
     """
 
     waiting_for_text = State()

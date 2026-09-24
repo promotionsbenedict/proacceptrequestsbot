@@ -1,77 +1,83 @@
+import logging
+
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
+from ..config import Config
 from ..database import Database, decode_buttons, encode_buttons
-from ..keyboards import cancel_keyboard, message_menu_keyboard
+from ..keyboards import cancel_keyboard, global_message_menu_keyboard
 from ..messaging import parse_buttons
 from ..states import CustomizeMessage
 
+logger = logging.getLogger(__name__)
 router = Router()
 
 _KIND_LABEL = {"welcome": "👋 Welcome", "goodbye": "🚪 Goodbye"}
 
 
-async def _owned_channel(query: CallbackQuery, db: Database, channel_id: int):
-    channel = await db.get_channel(channel_id)
-    if channel is None or channel["owner_id"] != query.from_user.id:
-        await query.answer("Channel not found.", show_alert=True)
-        return None
-    return channel
+def _is_admin(user_id: int, config: Config) -> bool:
+    return user_id == config.admin_id
 
 
-def _describe(channel, kind: str) -> str:
+def _describe(message, kind: str) -> str:
     label = _KIND_LABEL[kind]
-    enabled = "on" if channel[f"{kind}_enabled"] else "off"
-    text = channel[f"{kind}_text"] or "—"
-    has_image = "yes" if channel[f"{kind}_image"] else "no"
-    buttons = decode_buttons(channel[f"{kind}_buttons"])
+    enabled = "on" if message["enabled"] else "off"
+    text = message["text"] or "—"
+    has_image = "yes" if message["image"] else "no"
+    buttons = decode_buttons(message["buttons"])
     return (
-        f"<b>{label} message</b> for <b>{channel['title']}</b>\n\n"
+        f"<b>{label} message</b> (global)\n\n"
         f"Status: {enabled}\n"
         f"Image: {has_image}\n"
         f"Buttons: {len(buttons)}\n\n"
         f"<b>Text:</b>\n{text}\n\n"
-        "Placeholders: <code>{first_name}</code>, <code>{chat_title}</code>"
+        "Placeholders: <code>{first_name}</code>, <code>{chat_title}</code>\n"
+        "This message is used for every connected channel and group."
     )
 
 
-@router.callback_query(F.data.startswith("msg:"))
-async def open_message_menu(query: CallbackQuery, db: Database) -> None:
-    _, kind, cid = query.data.split(":")
-    channel = await _owned_channel(query, db, int(cid))
-    if channel is None:
+@router.callback_query(F.data.startswith("gmsg:"))
+async def open_message_menu(query: CallbackQuery, db: Database, config: Config) -> None:
+    if not _is_admin(query.from_user.id, config):
+        await query.answer()
         return
+    kind = query.data.split(":", 1)[1]
+    message = await db.get_global_message(kind)
     await query.answer()
     await query.message.answer(
-        _describe(channel, kind), reply_markup=message_menu_keyboard(channel, kind)
+        _describe(message, kind), reply_markup=global_message_menu_keyboard(message, kind)
     )
 
 
-@router.callback_query(F.data.startswith("mtoggle:"))
-async def toggle_message(query: CallbackQuery, db: Database) -> None:
-    _, kind, cid = query.data.split(":")
-    channel = await _owned_channel(query, db, int(cid))
-    if channel is None:
+@router.callback_query(F.data.startswith("gtoggle:"))
+async def toggle_message(query: CallbackQuery, db: Database, config: Config) -> None:
+    if not _is_admin(query.from_user.id, config):
+        await query.answer()
         return
-    new_value = 0 if channel[f"{kind}_enabled"] else 1
-    await db.update_channel_field(int(cid), f"{kind}_enabled", new_value)
+    kind = query.data.split(":", 1)[1]
+    message = await db.get_global_message(kind)
+    new_value = 0 if message["enabled"] else 1
+    await db.set_global_message_field(kind, "enabled", new_value)
     await query.answer("Enabled 🔔" if new_value else "Disabled 🔕")
-    updated = await db.get_channel(int(cid))
+    updated = await db.get_global_message(kind)
     try:
         await query.message.edit_reply_markup(
-            reply_markup=message_menu_keyboard(updated, kind)
+            reply_markup=global_message_menu_keyboard(updated, kind)
         )
     except TelegramBadRequest:
         pass
 
 
-@router.callback_query(F.data.startswith("settext:"))
-async def ask_text(query: CallbackQuery, state: FSMContext) -> None:
-    _, kind, cid = query.data.split(":")
+@router.callback_query(F.data.startswith("gsettext:"))
+async def ask_text(query: CallbackQuery, state: FSMContext, config: Config) -> None:
+    if not _is_admin(query.from_user.id, config):
+        await query.answer()
+        return
+    kind = query.data.split(":", 1)[1]
     await state.set_state(CustomizeMessage.waiting_for_text)
-    await state.update_data(channel_id=int(cid), kind=kind)
+    await state.update_data(kind=kind)
     await query.answer()
     await query.message.answer(
         "Send the new message text.\n\n"
@@ -84,19 +90,23 @@ async def ask_text(query: CallbackQuery, state: FSMContext) -> None:
 @router.message(CustomizeMessage.waiting_for_text)
 async def save_text(message: Message, db: Database, state: FSMContext) -> None:
     data = await state.get_data()
-    await db.update_channel_field(data["channel_id"], f"{data['kind']}_text", message.text or "")
+    kind = data["kind"]
+    await db.set_global_message_field(kind, "text", message.text or "")
     await state.clear()
-    channel = await db.get_channel(data["channel_id"])
+    updated = await db.get_global_message(kind)
     await message.answer(
-        "✅ Text updated.", reply_markup=message_menu_keyboard(channel, data["kind"])
+        "✅ Text updated.", reply_markup=global_message_menu_keyboard(updated, kind)
     )
 
 
-@router.callback_query(F.data.startswith("setimg:"))
-async def ask_image(query: CallbackQuery, state: FSMContext) -> None:
-    _, kind, cid = query.data.split(":")
+@router.callback_query(F.data.startswith("gsetimg:"))
+async def ask_image(query: CallbackQuery, state: FSMContext, config: Config) -> None:
+    if not _is_admin(query.from_user.id, config):
+        await query.answer()
+        return
+    kind = query.data.split(":", 1)[1]
     await state.set_state(CustomizeMessage.waiting_for_image)
-    await state.update_data(channel_id=int(cid), kind=kind)
+    await state.update_data(kind=kind)
     await query.answer()
     await query.message.answer(
         "Send a photo to attach to this message.", reply_markup=cancel_keyboard()
@@ -106,12 +116,13 @@ async def ask_image(query: CallbackQuery, state: FSMContext) -> None:
 @router.message(CustomizeMessage.waiting_for_image, F.photo)
 async def save_image(message: Message, db: Database, state: FSMContext) -> None:
     data = await state.get_data()
+    kind = data["kind"]
     file_id = message.photo[-1].file_id
-    await db.update_channel_field(data["channel_id"], f"{data['kind']}_image", file_id)
+    await db.set_global_message_field(kind, "image", file_id)
     await state.clear()
-    channel = await db.get_channel(data["channel_id"])
+    updated = await db.get_global_message(kind)
     await message.answer(
-        "✅ Image saved.", reply_markup=message_menu_keyboard(channel, data["kind"])
+        "✅ Image saved.", reply_markup=global_message_menu_keyboard(updated, kind)
     )
 
 
@@ -120,14 +131,17 @@ async def image_expected(message: Message) -> None:
     await message.answer("Please send a photo, or tap Cancel.")
 
 
-@router.callback_query(F.data.startswith("setbtn:"))
-async def ask_buttons(query: CallbackQuery, state: FSMContext) -> None:
-    _, kind, cid = query.data.split(":")
+@router.callback_query(F.data.startswith("gsetbtn:"))
+async def ask_buttons(query: CallbackQuery, state: FSMContext, config: Config) -> None:
+    if not _is_admin(query.from_user.id, config):
+        await query.answer()
+        return
+    kind = query.data.split(":", 1)[1]
     await state.set_state(CustomizeMessage.waiting_for_buttons)
-    await state.update_data(channel_id=int(cid), kind=kind)
+    await state.update_data(kind=kind)
     await query.answer()
     await query.message.answer(
-        "Send inline buttons, one per line, in the form:\n\n"
+        "Send promotional inline buttons, one per line, in the form:\n\n"
         "<code>Label - https://example.com</code>\n\n"
         "You can send several lines for several buttons.",
         reply_markup=cancel_keyboard(),
@@ -137,52 +151,51 @@ async def ask_buttons(query: CallbackQuery, state: FSMContext) -> None:
 @router.message(CustomizeMessage.waiting_for_buttons)
 async def save_buttons(message: Message, db: Database, state: FSMContext) -> None:
     data = await state.get_data()
+    kind = data["kind"]
     buttons = parse_buttons(message.text or "")
     if not buttons:
         await message.answer(
             "❌ No valid buttons found. Use <code>Label - https://url</code> per line."
         )
         return
-    await db.update_channel_field(
-        data["channel_id"], f"{data['kind']}_buttons", encode_buttons(buttons)
-    )
+    await db.set_global_message_field(kind, "buttons", encode_buttons(buttons))
     await state.clear()
-    channel = await db.get_channel(data["channel_id"])
+    updated = await db.get_global_message(kind)
     await message.answer(
         f"✅ Saved {len(buttons)} button(s).",
-        reply_markup=message_menu_keyboard(channel, data["kind"]),
+        reply_markup=global_message_menu_keyboard(updated, kind),
     )
 
 
-@router.callback_query(F.data.startswith("clrimg:"))
-async def clear_image(query: CallbackQuery, db: Database) -> None:
-    _, kind, cid = query.data.split(":")
-    channel = await _owned_channel(query, db, int(cid))
-    if channel is None:
+@router.callback_query(F.data.startswith("gclrimg:"))
+async def clear_image(query: CallbackQuery, db: Database, config: Config) -> None:
+    if not _is_admin(query.from_user.id, config):
+        await query.answer()
         return
-    await db.update_channel_field(int(cid), f"{kind}_image", None)
+    kind = query.data.split(":", 1)[1]
+    await db.set_global_message_field(kind, "image", None)
     await query.answer("Image cleared.")
-    updated = await db.get_channel(int(cid))
+    updated = await db.get_global_message(kind)
     try:
         await query.message.edit_reply_markup(
-            reply_markup=message_menu_keyboard(updated, kind)
+            reply_markup=global_message_menu_keyboard(updated, kind)
         )
     except TelegramBadRequest:
         pass
 
 
-@router.callback_query(F.data.startswith("clrbtn:"))
-async def clear_buttons(query: CallbackQuery, db: Database) -> None:
-    _, kind, cid = query.data.split(":")
-    channel = await _owned_channel(query, db, int(cid))
-    if channel is None:
+@router.callback_query(F.data.startswith("gclrbtn:"))
+async def clear_buttons(query: CallbackQuery, db: Database, config: Config) -> None:
+    if not _is_admin(query.from_user.id, config):
+        await query.answer()
         return
-    await db.update_channel_field(int(cid), f"{kind}_buttons", None)
+    kind = query.data.split(":", 1)[1]
+    await db.set_global_message_field(kind, "buttons", None)
     await query.answer("Buttons cleared.")
-    updated = await db.get_channel(int(cid))
+    updated = await db.get_global_message(kind)
     try:
         await query.message.edit_reply_markup(
-            reply_markup=message_menu_keyboard(updated, kind)
+            reply_markup=global_message_menu_keyboard(updated, kind)
         )
     except TelegramBadRequest:
         pass

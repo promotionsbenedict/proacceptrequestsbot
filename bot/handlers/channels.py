@@ -158,11 +158,15 @@ async def receive_channel(
     await state.clear()
 
     channel = await db.get_channel(channel_id)
+    pending = await db.count_pending(chat.id)
     await message.answer(
         f"✅ Connected <b>{chat.title}</b> and activated auto-approval.\n\n"
-        "New join requests will now be approved automatically. "
-        "Customize the welcome message below.",
-        reply_markup=channel_manage_keyboard(channel),
+        "New join requests will now be approved automatically. Use "
+        "<b>✅ Approve All Pending</b> to clear requests that are already waiting.\n\n"
+        "<i>Note: Telegram does not let bots fetch join requests that were "
+        "submitted before I became an administrator. Only requests I receive "
+        "while I am an admin can be approved automatically or in bulk.</i>",
+        reply_markup=channel_manage_keyboard(channel, pending),
     )
 
 
@@ -176,16 +180,14 @@ async def _show_manage(query: CallbackQuery, db: Database, channel_id: int) -> N
         return
     pending = await db.count_pending(channel["chat_id"])
     status = "🟢 Active" if channel["is_active"] else "🔴 Inactive"
-    welcome = "on" if channel["welcome_enabled"] else "off"
-    goodbye = "on" if channel["goodbye_enabled"] else "off"
     text = (
         f"<b>{channel['title'] or 'Channel'}</b>\n\n"
         f"Status: {status}\n"
-        f"Welcome message: {welcome}\n"
-        f"Goodbye message: {goodbye}\n"
         f"Pending requests: {pending}"
     )
-    await query.message.answer(text, reply_markup=channel_manage_keyboard(channel))
+    await query.message.answer(
+        text, reply_markup=channel_manage_keyboard(channel, pending)
+    )
 
 
 @router.callback_query(F.data.startswith("ch:"))
@@ -206,9 +208,10 @@ async def toggle_channel(query: CallbackQuery, db: Database) -> None:
     await db.set_channel_active(channel_id, new_active)
     await query.answer("Activated ✅" if new_active else "Deactivated ⏸")
     updated = await db.get_channel(channel_id)
+    pending = await db.count_pending(updated["chat_id"])
     try:
         await query.message.edit_reply_markup(
-            reply_markup=channel_manage_keyboard(updated)
+            reply_markup=channel_manage_keyboard(updated, pending)
         )
     except TelegramBadRequest:
         pass

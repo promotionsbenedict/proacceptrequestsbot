@@ -51,23 +51,28 @@ async def deliver_message(
     db: Database,
     user_id: int,
     first_name: str,
-    channel_row,
+    chat_title: str,
     kind: str,
 ) -> bool:
-    """Send a welcome/goodbye DM to a user. Returns True on success.
+    """Send the global welcome/goodbye DM to a user. Returns True on success.
 
-    Delivery only works if the user has already started the bot (Telegram rule),
-    so failures are expected and swallowed.
+    Message content is admin-controlled and global (see the ``global_messages``
+    table). Delivery only works if the user has already started the bot
+    (Telegram rule), so failures are expected and swallowed.
     """
+    message = await db.get_global_message(kind)
+    if message is None or not message["enabled"]:
+        return False
+
     text = render_text(
-        channel_row[f"{kind}_text"],
+        message["text"],
         first_name=first_name,
-        chat_title=channel_row["title"] or "the channel",
+        chat_title=chat_title or "the channel",
     )
-    image = channel_row[f"{kind}_image"]
-    owner_buttons = decode_buttons(channel_row[f"{kind}_buttons"])
+    image = message["image"]
+    admin_buttons = decode_buttons(message["buttons"])
     promoted = await db.list_promoted()
-    keyboard = build_keyboard(owner_buttons, promoted)
+    keyboard = build_keyboard(admin_buttons, promoted)
 
     try:
         if image:

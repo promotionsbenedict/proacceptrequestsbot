@@ -61,41 +61,36 @@ def channels_list_keyboard(channels: list) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def channel_manage_keyboard(channel) -> InlineKeyboardMarkup:
+def channel_manage_keyboard(channel, pending_count: int = 0) -> InlineKeyboardMarkup:
     active = channel["is_active"]
     toggle_label = "⏸ Deactivate" if active else "▶️ Activate"
+    approve_label = (
+        f"✅ Approve All Pending ({pending_count})"
+        if pending_count
+        else "✅ Approve All Pending"
+    )
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=toggle_label, callback_data=f"toggle:{channel['id']}")],
-            [
-                InlineKeyboardButton(
-                    text="👋 Welcome Message", callback_data=f"msg:welcome:{channel['id']}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🚪 Goodbye Message", callback_data=f"msg:goodbye:{channel['id']}"
-                )
-            ],
+            [InlineKeyboardButton(text=approve_label, callback_data=f"approve:{channel['id']}")],
             [InlineKeyboardButton(text="🗑 Remove", callback_data=f"del:{channel['id']}")],
             [InlineKeyboardButton(text="⬅️ Back", callback_data="my_channels")],
         ]
     )
 
 
-def message_menu_keyboard(channel, kind: str) -> InlineKeyboardMarkup:
-    enabled = channel[f"{kind}_enabled"]
+def global_message_menu_keyboard(message, kind: str) -> InlineKeyboardMarkup:
+    enabled = message["enabled"]
     toggle_label = "🔕 Disable" if enabled else "🔔 Enable"
-    cid = channel["id"]
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=toggle_label, callback_data=f"mtoggle:{kind}:{cid}")],
-            [InlineKeyboardButton(text="📝 Set Text", callback_data=f"settext:{kind}:{cid}")],
-            [InlineKeyboardButton(text="🖼 Set Image", callback_data=f"setimg:{kind}:{cid}")],
-            [InlineKeyboardButton(text="🔘 Set Buttons", callback_data=f"setbtn:{kind}:{cid}")],
-            [InlineKeyboardButton(text="🧹 Clear Image", callback_data=f"clrimg:{kind}:{cid}")],
-            [InlineKeyboardButton(text="🧹 Clear Buttons", callback_data=f"clrbtn:{kind}:{cid}")],
-            [InlineKeyboardButton(text="⬅️ Back", callback_data=f"ch:{cid}")],
+            [InlineKeyboardButton(text=toggle_label, callback_data=f"gtoggle:{kind}")],
+            [InlineKeyboardButton(text="📝 Set Text", callback_data=f"gsettext:{kind}")],
+            [InlineKeyboardButton(text="🖼 Set Image", callback_data=f"gsetimg:{kind}")],
+            [InlineKeyboardButton(text="🔘 Set Buttons", callback_data=f"gsetbtn:{kind}")],
+            [InlineKeyboardButton(text="🧹 Clear Image", callback_data=f"gclrimg:{kind}")],
+            [InlineKeyboardButton(text="🧹 Clear Buttons", callback_data=f"gclrbtn:{kind}")],
+            [InlineKeyboardButton(text="⬅️ Back", callback_data="admin_home")],
         ]
     )
 
@@ -144,6 +139,8 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📊 Stats", callback_data="admin_stats")],
+            [InlineKeyboardButton(text="👋 Welcome Message", callback_data="gmsg:welcome")],
+            [InlineKeyboardButton(text="🚪 Goodbye Message", callback_data="gmsg:goodbye")],
             [InlineKeyboardButton(text="📣 Promoted Channels", callback_data="admin_promoted")],
             [InlineKeyboardButton(text="📢 Broadcast", callback_data="admin_broadcast")],
             [InlineKeyboardButton(text="⚡ Grant Premium", callback_data="admin_grant")],
