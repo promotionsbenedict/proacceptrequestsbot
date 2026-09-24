@@ -1,0 +1,15 @@
+services:
+  bot:
+    build: .
+    container_name: pro-accept-requests
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Store the DB on the mounted volume regardless of .env
+      DATABASE_PATH: data/pro_accept_requests.db
+    volumes:
+      - bot-data:/app/data
+
+volumes:
+  bot-data:
