@@ -7,6 +7,7 @@ from aiogram.types import CallbackQuery, Chat, Message
 
 from ..config import Config
 from ..database import FREE_CHANNEL_LIMIT, Database
+from ..helper import HelperUserbot, resolve_pending_count
 from ..keyboards import (
     BTN_ADD,
     BTN_MY,
@@ -95,7 +96,7 @@ def _extract_forward_chat(message: Message) -> Chat | None:
 
 @router.message(AddChannel.waiting_for_channel)
 async def receive_channel(
-    message: Message, db: Database, state: FSMContext, bot: Bot
+    message: Message, db: Database, state: FSMContext, bot: Bot, helper: HelperUserbot
 ) -> None:
     chat: Chat | None = _extract_forward_chat(message)
 
@@ -158,14 +159,28 @@ async def receive_channel(
     await state.clear()
 
     channel = await db.get_channel(channel_id)
-    pending = await db.count_pending(chat.id)
+
+    # Try to connect the helper userbot so historical requests can be approved.
+    helper_note = (
+        "\n\n<i>Note: without a helper account, Telegram only lets me approve "
+        "requests received while I'm an admin.</i>"
+    )
+    if helper.ready:
+        access = await helper.ensure_access(bot, chat.id)
+        if access.ok:
+            helper_note = (
+                "\n\n🤝 Helper connected — I can now also approve requests that "
+                "were submitted <b>before</b> I became an admin. Use "
+                "<b>✅ Approve All Pending</b> to clear them."
+            )
+        else:
+            helper_note = f"\n\n⚠️ {access.message}"
+
+    pending, _live = await resolve_pending_count(helper, db, channel)
     await message.answer(
         f"✅ Connected <b>{chat.title}</b> and activated auto-approval.\n\n"
-        "New join requests will now be approved automatically. Use "
-        "<b>✅ Approve All Pending</b> to clear requests that are already waiting.\n\n"
-        "<i>Note: Telegram does not let bots fetch join requests that were "
-        "submitted before I became an administrator. Only requests I receive "
-        "while I am an admin can be approved automatically or in bulk.</i>",
+        "New join requests will now be approved automatically."
+        + helper_note,
         reply_markup=channel_manage_keyboard(channel, pending),
     )
 
@@ -173,17 +188,20 @@ async def receive_channel(
 # ---------- manage a single channel ----------
 
 
-async def _show_manage(query: CallbackQuery, db: Database, channel_id: int) -> None:
+async def _show_manage(
+    query: CallbackQuery, db: Database, helper: HelperUserbot, channel_id: int
+) -> None:
     channel = await db.get_channel(channel_id)
     if channel is None or channel["owner_id"] != query.from_user.id:
         await query.answer("Channel not found.", show_alert=True)
         return
-    pending = await db.count_pending(channel["chat_id"])
+    pending, live = await resolve_pending_count(helper, db, channel)
     status = "🟢 Active" if channel["is_active"] else "🔴 Inactive"
+    count_label = "Pending requests" if live else "Pending requests (tracked)"
     text = (
         f"<b>{channel['title'] or 'Channel'}</b>\n\n"
         f"Status: {status}\n"
-        f"Pending requests: {pending}"
+        f"{count_label}: {pending}"
     )
     await query.message.answer(
         text, reply_markup=channel_manage_keyboard(channel, pending)
@@ -191,10 +209,10 @@ async def _show_manage(query: CallbackQuery, db: Database, channel_id: int) -> N
 
 
 @router.callback_query(F.data.startswith("ch:"))
-async def open_channel(query: CallbackQuery, db: Database) -> None:
+async def open_channel(query: CallbackQuery, db: Database, helper: HelperUserbot) -> None:
     await query.answer()
     channel_id = int(query.data.split(":", 1)[1])
-    await _show_manage(query, db, channel_id)
+    await _show_manage(query, db, helper, channel_id)
 
 
 @router.callback_query(F.data.startswith("toggle:"))

@@ -5,6 +5,15 @@ class AddChannel(StatesGroup):
     waiting_for_channel = State()
 
 
+class ApprovePending(StatesGroup):
+    """Ask the owner how many pending requests to approve.
+
+    `state.data` carries {"channel_id": int}.
+    """
+
+    waiting_for_amount = State()
+
+
 class CustomizeMessage(StatesGroup):
     """Shared states for editing the global welcome/goodbye content (admin only).
 

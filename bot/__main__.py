@@ -10,6 +10,7 @@ from aiogram.types import BotCommand
 from .config import load_config
 from .database import Database
 from .handlers import register_handlers
+from .helper import HelperUserbot
 from .middlewares import SubscriptionMiddleware
 
 logging.basicConfig(
@@ -35,6 +36,17 @@ async def main() -> None:
     await db.connect()
     logger.info("Database ready at %s", config.database_path)
 
+    helper = HelperUserbot(
+        config.helper_api_id, config.helper_api_hash, config.helper_session
+    )
+    await helper.start()
+    if helper.ready:
+        logger.info("Helper userbot ready (@%s).", helper.username)
+    elif config.helper_configured:
+        logger.warning("Helper configured but not authorized; historical approval disabled.")
+    else:
+        logger.info("Helper userbot not configured; historical approval disabled.")
+
     bot = Bot(
         token=config.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -44,6 +56,7 @@ async def main() -> None:
     # Make shared services injectable into handlers.
     dp["db"] = db
     dp["config"] = config
+    dp["helper"] = helper
 
     # Enforce mandatory-channel membership on all user interactions.
     sub_mw = SubscriptionMiddleware(config)
@@ -59,6 +72,7 @@ async def main() -> None:
     try:
         await dp.start_polling(bot, allowed_updates=allowed)
     finally:
+        await helper.stop()
         await db.close()
         await bot.session.close()
 

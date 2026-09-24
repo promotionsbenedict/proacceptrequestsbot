@@ -73,6 +73,7 @@ def channel_manage_keyboard(channel, pending_count: int = 0) -> InlineKeyboardMa
         inline_keyboard=[
             [InlineKeyboardButton(text=toggle_label, callback_data=f"toggle:{channel['id']}")],
             [InlineKeyboardButton(text=approve_label, callback_data=f"approve:{channel['id']}")],
+            [InlineKeyboardButton(text="🔢 Approve Custom Amount", callback_data=f"custom:{channel['id']}")],
             [InlineKeyboardButton(text="🗑 Remove", callback_data=f"del:{channel['id']}")],
             [InlineKeyboardButton(text="⬅️ Back", callback_data="my_channels")],
         ]
