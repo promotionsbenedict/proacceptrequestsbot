@@ -128,6 +128,14 @@ def pending_keyboard(entries: list[tuple]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def approval_progress_keyboard(channel_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🛑 Stop", callback_data=f"apstop:{channel_id}")]
+        ]
+    )
+
+
 def premium_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[

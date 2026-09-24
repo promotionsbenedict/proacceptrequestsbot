@@ -11,6 +11,7 @@ from .config import load_config
 from .database import Database
 from .handlers import register_handlers
 from .helper import HelperUserbot
+from .jobs import JobManager
 from .middlewares import SubscriptionMiddleware
 
 logging.basicConfig(
@@ -57,6 +58,7 @@ async def main() -> None:
     dp["db"] = db
     dp["config"] = config
     dp["helper"] = helper
+    dp["jobs"] = JobManager()
 
     # Enforce mandatory-channel membership on all user interactions.
     sub_mw = SubscriptionMiddleware(config)
