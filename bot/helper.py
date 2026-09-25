@@ -25,6 +25,15 @@ logger = logging.getLogger(__name__)
 # bulk approvals; anything longer than this almost always means a temporary ban.
 MAX_FLOOD_WAIT = 3600  # seconds
 
+# How many *consecutive* recoverable errors (timeouts, server/RPC failures,
+# dropped connections) we ride out before pausing a run. Each retry waits with
+# exponential backoff and re-counts the queue, so we never lose progress or
+# double-count — we simply resume from whatever is still pending on Telegram.
+MAX_RECOVERABLE_RETRIES = 12
+
+# Upper bound (seconds) on the exponential backoff between recoverable retries.
+MAX_BACKOFF = 60
+
 # Optional callbacks used by the streaming approvers.
 ProgressCb = Callable[[int, int], Awaitable[None]]
 CancelCb = Callable[[], bool]
@@ -305,6 +314,47 @@ class HelperUserbot:
                 return
             await asyncio.sleep(min(1.0, remaining))
 
+    @staticmethod
+    def _is_recoverable(exc: BaseException) -> bool:
+        """True for transient failures worth waiting out and retrying.
+
+        Covers Python transport failures (timeouts, dropped connections) and
+        Telegram's temporary server-side/RPC errors, including Telethon's
+        "Request was unsuccessful N time(s)" once its own retries are exhausted.
+        """
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)):
+            return True
+        if TELETHON_AVAILABLE:
+            for cls_name in (
+                "ServerError",
+                "TimedOutError",
+                "TimeoutError",
+                "RpcCallFailError",
+                "RpcMcgetFailError",
+            ):
+                cls = getattr(errors, cls_name, None)
+                if cls is not None and isinstance(exc, cls):
+                    return True
+        msg = str(exc).lower()
+        return "request was unsuccessful" in msg or "timeout" in msg or "timed out" in msg
+
+    @staticmethod
+    def _backoff(attempt: int) -> int:
+        """Exponential backoff in seconds for the Nth consecutive retry."""
+        return min(2 ** attempt, MAX_BACKOFF)
+
+    async def _ensure_connected(self) -> None:
+        """Reconnect the Telethon client if the connection has dropped."""
+        client = self._client
+        if client is None:
+            return
+        try:
+            if not client.is_connected():
+                logger.info("Helper reconnecting after dropped connection…")
+                await client.connect()
+        except Exception as exc:
+            logger.warning("Helper reconnect attempt failed: %s", exc)
+
     # ---------- public reads ----------
 
     async def get_pending_count(self, chat_id: int) -> Optional[int]:
@@ -350,12 +400,17 @@ class HelperUserbot:
                 await progress(approved, total)
 
             stagnant = 0
+            errors_in_a_row = 0
             while remaining > 0:
                 if cancelled is not None and cancelled():
                     return ApproveResult(approved=approved, cancelled=True)
 
+                # ---- clear a server-side chunk ----
+                hide_ok = False
                 try:
                     await self._hide_all(peer)
+                    hide_ok = True
+                    errors_in_a_row = 0
                 except errors.FloodWaitError as exc:
                     if exc.seconds > MAX_FLOOD_WAIT:
                         return ApproveResult(
@@ -366,27 +421,98 @@ class HelperUserbot:
                                 "later to continue."
                             ),
                         )
+                    logger.warning(
+                        "approve_all flood-wait chat=%s wait=%ss approved=%s remaining=%s",
+                        chat_id, exc.seconds, approved, remaining,
+                    )
                     await self._sleep_cancellable(exc.seconds + 1, cancelled)
                     continue
+                except Exception as exc:
+                    if not self._is_recoverable(exc):
+                        raise
+                    errors_in_a_row += 1
+                    if errors_in_a_row > MAX_RECOVERABLE_RETRIES:
+                        logger.error(
+                            "approve_all pausing chat=%s after %s consecutive "
+                            "recoverable errors; approved=%s remaining=%s last=%r",
+                            chat_id, errors_in_a_row, approved, remaining, exc,
+                        )
+                        return ApproveResult(
+                            approved=approved,
+                            note=(
+                                "Paused after repeated Telegram timeouts. Approved "
+                                "so far are done; tap Approve All again to continue "
+                                "from what's still pending."
+                            ),
+                        )
+                    wait = self._backoff(errors_in_a_row)
+                    logger.warning(
+                        "approve_all recoverable error chat=%s retry=%s/%s wait=%ss "
+                        "approved=%s remaining=%s exc=%r",
+                        chat_id, errors_in_a_row, MAX_RECOVERABLE_RETRIES, wait,
+                        approved, remaining, exc,
+                    )
+                    await self._sleep_cancellable(wait, cancelled)
+                    if cancelled is not None and cancelled():
+                        return ApproveResult(approved=approved, cancelled=True)
+                    await self._ensure_connected()
+                    # fall through: recount below to credit anything that landed
 
-                # Give Telegram a moment to settle, then measure real progress.
+                # ---- settle, then recount to measure real progress ----
                 await asyncio.sleep(0.7)
-                new_remaining = await self._count_requests(peer)
+                try:
+                    new_remaining = await self._count_requests(peer)
+                except Exception as exc:
+                    if not self._is_recoverable(exc):
+                        raise
+                    errors_in_a_row += 1
+                    if errors_in_a_row > MAX_RECOVERABLE_RETRIES:
+                        logger.error(
+                            "approve_all pausing chat=%s after %s consecutive "
+                            "recount errors; approved=%s last=%r",
+                            chat_id, errors_in_a_row, approved, exc,
+                        )
+                        return ApproveResult(
+                            approved=approved,
+                            note=(
+                                "Paused after repeated Telegram timeouts. Approved "
+                                "so far are done; tap Approve All again to continue."
+                            ),
+                        )
+                    wait = self._backoff(errors_in_a_row)
+                    logger.warning(
+                        "approve_all recount error chat=%s retry=%s/%s wait=%ss "
+                        "approved=%s remaining=%s exc=%r",
+                        chat_id, errors_in_a_row, MAX_RECOVERABLE_RETRIES, wait,
+                        approved, remaining, exc,
+                    )
+                    await self._sleep_cancellable(wait, cancelled)
+                    await self._ensure_connected()
+                    continue
+
+                # Credit whatever actually drained — even if the hide call itself
+                # timed out, some approvals may have landed server-side.
                 delta = remaining - new_remaining
                 remaining = new_remaining
                 if delta > 0:
                     approved += delta
-                    stagnant = 0
                     total = max(total, approved + remaining)
+                    # Real progress means we're not genuinely stuck: forgive the
+                    # earlier timeouts so intermittent errors never pause a run
+                    # that is still draining.
+                    errors_in_a_row = 0
                     if progress is not None:
                         await progress(approved, total)
-                else:
-                    # No drop: either the queue is drained or new requests are
-                    # arriving as fast as we clear them. Bail out after a few
-                    # fruitless passes so we never spin forever.
-                    stagnant += 1
-                    if stagnant >= 3:
-                        break
+
+                # Stagnation only counts against clean calls that cleared nothing;
+                # a recovered timeout should not trip the "drained" heuristic.
+                if hide_ok:
+                    if delta > 0:
+                        stagnant = 0
+                    else:
+                        stagnant += 1
+                        if stagnant >= 3:
+                            break
 
             return ApproveResult(approved=approved)
         except errors.ChatAdminRequiredError:
@@ -416,6 +542,7 @@ class HelperUserbot:
 
         approved: list[int] = []
         failed = 0
+        fetch_errors = 0
         try:
             peer = await self._resolve_peer(chat_id)
             if progress is not None:
@@ -430,9 +557,58 @@ class HelperUserbot:
                         cancelled=True,
                     )
 
-                batch = await self._fetch_requests(
-                    peer, limit=min(100, amount - len(approved))
-                )
+                try:
+                    batch = await self._fetch_requests(
+                        peer, limit=min(100, amount - len(approved))
+                    )
+                    fetch_errors = 0
+                except errors.FloodWaitError as exc:
+                    if exc.seconds > MAX_FLOOD_WAIT:
+                        return ApproveResult(
+                            approved=len(approved),
+                            failed=failed,
+                            user_ids=approved,
+                            note=(
+                                "Paused — Telegram asked for a long wait. Approved "
+                                "so far are done; run it again later to continue."
+                            ),
+                        )
+                    logger.warning(
+                        "approve_amount fetch flood-wait chat=%s wait=%ss approved=%s",
+                        chat_id, exc.seconds, len(approved),
+                    )
+                    await self._sleep_cancellable(exc.seconds + 1, cancelled)
+                    continue
+                except Exception as exc:
+                    if not self._is_recoverable(exc):
+                        raise
+                    fetch_errors += 1
+                    if fetch_errors > MAX_RECOVERABLE_RETRIES:
+                        logger.error(
+                            "approve_amount pausing chat=%s after %s consecutive "
+                            "fetch errors; approved=%s last=%r",
+                            chat_id, fetch_errors, len(approved), exc,
+                        )
+                        return ApproveResult(
+                            approved=len(approved),
+                            failed=failed,
+                            user_ids=approved,
+                            note=(
+                                "Paused after repeated Telegram timeouts. Approved "
+                                "so far are done; run it again to continue."
+                            ),
+                        )
+                    wait = self._backoff(fetch_errors)
+                    logger.warning(
+                        "approve_amount fetch recoverable error chat=%s retry=%s/%s "
+                        "wait=%ss approved=%s exc=%r",
+                        chat_id, fetch_errors, MAX_RECOVERABLE_RETRIES, wait,
+                        len(approved), exc,
+                    )
+                    await self._sleep_cancellable(wait, cancelled)
+                    await self._ensure_connected()
+                    continue
+
                 if not batch.importers:
                     break
 
@@ -507,6 +683,7 @@ class HelperUserbot:
 
     async def _approve_one(self, peer, target, cancelled: Optional[CancelCb]):
         """Approve one request. Returns True | False | 'cancelled' | 'flood'."""
+        attempt = 0
         while True:
             try:
                 await self._hide_one(peer, target)
@@ -519,6 +696,25 @@ class HelperUserbot:
                     return "cancelled"
                 # loop and retry the same user
             except Exception as exc:
+                if self._is_recoverable(exc):
+                    attempt += 1
+                    if attempt > MAX_RECOVERABLE_RETRIES:
+                        logger.warning(
+                            "approve one giving up target=%s after %s retries: %r",
+                            target, attempt, exc,
+                        )
+                        return False
+                    wait = self._backoff(attempt)
+                    logger.warning(
+                        "approve one recoverable error target=%s retry=%s/%s "
+                        "wait=%ss exc=%r",
+                        target, attempt, MAX_RECOVERABLE_RETRIES, wait, exc,
+                    )
+                    await self._sleep_cancellable(wait, cancelled)
+                    if cancelled is not None and cancelled():
+                        return "cancelled"
+                    await self._ensure_connected()
+                    continue
                 logger.info("approve one failed (%s): %s", target, exc)
                 return False
 
