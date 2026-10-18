@@ -34,6 +34,12 @@ MAX_RECOVERABLE_RETRIES = 12
 # Upper bound (seconds) on the exponential backoff between recoverable retries.
 MAX_BACKOFF = 60
 
+# Telegram answers HideAll with HIDE_REQUESTER_MISSING ("the join request was
+# missing or was already handled") when its queue snapshot changed mid-call,
+# often after part of the batch was approved. We recount and continue, but stop
+# after this many consecutive conflicts that produce no verified queue decrease.
+MAX_CONFLICT_STALLS = 3
+
 # Optional callbacks used by the streaming approvers.
 ProgressCb = Callable[[int, int], Awaitable[None]]
 CancelCb = Callable[[], bool]
@@ -339,6 +345,19 @@ class HelperUserbot:
         return "request was unsuccessful" in msg or "timeout" in msg or "timed out" in msg
 
     @staticmethod
+    def _is_queue_conflict(exc: BaseException) -> bool:
+        """True when Telegram says the join request was missing/already handled."""
+        if TELETHON_AVAILABLE:
+            cls = getattr(errors, "HideRequesterMissingError", None)
+            if cls is not None and isinstance(exc, cls):
+                return True
+        msg = str(exc).lower()
+        return (
+            "hide_requester_missing" in msg
+            or "missing or was already handled" in msg
+        )
+
+    @staticmethod
     def _backoff(attempt: int) -> int:
         """Exponential backoff in seconds for the Nth consecutive retry."""
         return min(2 ** attempt, MAX_BACKOFF)
@@ -401,12 +420,15 @@ class HelperUserbot:
 
             stagnant = 0
             errors_in_a_row = 0
+            conflict_stalls = 0
             while remaining > 0:
                 if cancelled is not None and cancelled():
                     return ApproveResult(approved=approved, cancelled=True)
 
                 # ---- clear a server-side chunk ----
                 hide_ok = False
+                conflict = False
+                last_exc: Optional[BaseException] = None
                 try:
                     await self._hide_all(peer)
                     hide_ok = True
@@ -428,9 +450,21 @@ class HelperUserbot:
                     await self._sleep_cancellable(exc.seconds + 1, cancelled)
                     continue
                 except Exception as exc:
-                    if not self._is_recoverable(exc):
+                    if self._is_queue_conflict(exc):
+                        conflict = True
+                        logger.warning(
+                            "approve_all queue conflict chat=%s stall=%s/%s "
+                            "approved=%s remaining=%s exc=%r; recounting",
+                            chat_id, conflict_stalls + 1, MAX_CONFLICT_STALLS,
+                            approved, remaining, exc,
+                        )
+                    elif not self._is_recoverable(exc):
                         raise
-                    errors_in_a_row += 1
+                    else:
+                        errors_in_a_row += 1
+                        last_exc = exc
+                if not hide_ok and not conflict:
+                    exc = last_exc
                     if errors_in_a_row > MAX_RECOVERABLE_RETRIES:
                         logger.error(
                             "approve_all pausing chat=%s after %s consecutive "
@@ -501,8 +535,37 @@ class HelperUserbot:
                     # earlier timeouts so intermittent errors never pause a run
                     # that is still draining.
                     errors_in_a_row = 0
+                    conflict_stalls = 0
                     if progress is not None:
                         await progress(approved, total)
+
+                # An already-handled/missing conflict is fine as long as the
+                # verified queue keeps shrinking; bail out if it stops doing so.
+                if conflict and delta <= 0 and remaining > 0:
+                    conflict_stalls += 1
+                    if conflict_stalls >= MAX_CONFLICT_STALLS:
+                        logger.error(
+                            "approve_all stopping chat=%s after %s queue conflicts "
+                            "with no progress; approved=%s remaining=%s",
+                            chat_id, conflict_stalls, approved, remaining,
+                        )
+                        return ApproveResult(
+                            approved=approved,
+                            note=(
+                                f"Stopped — Telegram reports the remaining "
+                                f"{remaining} request(s) as missing or already "
+                                "handled and the queue is no longer decreasing. "
+                                "Tap Approve All again later to retry."
+                            ),
+                        )
+                    wait = self._backoff(conflict_stalls)
+                    logger.warning(
+                        "approve_all conflict without progress chat=%s stall=%s/%s "
+                        "wait=%ss remaining=%s",
+                        chat_id, conflict_stalls, MAX_CONFLICT_STALLS, wait, remaining,
+                    )
+                    await self._sleep_cancellable(wait, cancelled)
+                    continue
 
                 # Stagnation only counts against clean calls that cleared nothing;
                 # a recovered timeout should not trip the "drained" heuristic.
